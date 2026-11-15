@@ -382,8 +382,8 @@ def make_report_notes(main, paths, full, sensitivity):
         "- For three documented stock-calendar gaps (Feb 2015, Oct 2016, Mar 2019), "
         "the last observed stock date precedes the official month-end. The code "
         "retains that earlier decision date and never uses a quote published later. "
-        "Those monthly returns can bridge a missing last-session movement; comparing "
-        "the stock series\u0027 missing last-session move. The matched-endpoint NIFTY "
+        "Those monthly returns can bridge a missing last-session movement. "
+        "The matched-endpoint NIFTY "
         "check in p5_endpoint_sensitivity.csv preserves the complete daily NIFTY "
         "training history and moves only those month-ends to the stock-observed dates.",
         "- T-bill yields are an investable-cash proxy, treated as continuously earning "
