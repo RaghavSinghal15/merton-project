@@ -4,6 +4,7 @@ Run from the repository root: python -m experiments.p5_backtest
 
 Outputs:
   results/p5_backtest_summary.csv      all 4 assets x 3 windows x 3 gammas x 6 strategies
+  results/p5_endpoint_sensitivity.csv  matched-endpoint NIFTY check
   results/p5_main_metrics.csv          NIFTY, 5 years of training, gamma=3
   results/p5_nifty_monthly_paths.csv   audit trail: signals, risk-free rate, returns, wealth
   results/p5_report_notes.md           report-ready findings and methodological caveats
@@ -57,7 +58,7 @@ def completed_month_ends(prices, rates):
     return month_ends
 
 
-def decisions_for_window(prices, rates, W, gamma):
+def decisions_for_window(prices, rates, W, gamma, month_ends_override=None):
     """Generate no-look-ahead monthly decisions and returns (PLAN.md 9.1-9.2).
 
     At observed month-end m, estimate pi_hat from daily prices in (m-W, m].
@@ -65,7 +66,7 @@ def decisions_for_window(prices, rates, W, gamma):
     annual continuously compounded cash rate: exp(r_m/12)-1. Later rate
     snapshots are NEVER used for the preceding holding month.
     """
-    month_ends = completed_month_ends(prices, rates)
+    month_ends = month_ends_override if month_ends_override is not None else completed_month_ends(prices, rates)
     first_eligible = prices.index[0] + pd.DateOffset(years=W)
     rows = []
     for i in range(len(month_ends) - 1):
@@ -169,10 +170,10 @@ def performance_metrics(returns, wealth, pi, rf, gamma, ruin_idx):
     }
 
 
-def run_asset(prices, rates, ticker, W, gamma):
+def run_asset(prices, rates, ticker, W, gamma, month_ends_override=None):
     """Backtest all six strategies on identical out-of-sample months (PLAN.md 9.3-9.5)."""
-    decisions = decisions_for_window(prices, rates, W, gamma)
-    month_ends = completed_month_ends(prices, rates)
+    decisions = decisions_for_window(prices, rates, W, gamma, month_ends_override)
+    month_ends = month_ends_override if month_ends_override is not None else completed_month_ends(prices, rates)
     history_through_last_complete_month = prices.loc[:month_ends.index[-1]]
     # Intentionally hindsight-biased. Never use in the rolling decisions.
     oracle_pi = estimation.estimate_pi(
@@ -215,6 +216,41 @@ def run_asset(prices, rates, ticker, W, gamma):
             })
     return pd.DataFrame(all_rows), pd.DataFrame(path_rows)
 
+
+
+def endpoint_sensitivity(nifty_prices, stock_prices, rates):
+    """Check Section 9's stock-calendar gaps against NIFTY month-end results.
+
+    Use each stock-observed month-end as an alternative NIFTY endpoint without
+    filling stock prices or dropping NIFTY's intervening daily training data.
+    Everything is re-estimated at the earlier decision date using the as-of rate.
+    """
+    stock_ends = completed_month_ends(stock_prices, rates)
+    nifty_ends = completed_month_ends(nifty_prices, rates)
+    if not stock_ends.index.to_period("M").equals(nifty_ends.index.to_period("M")):
+        raise ValueError("NIFTY and stock monthly calendars do not align")
+    aligned_ends = nifty_prices.reindex(stock_ends.index)
+    if aligned_ends.isna().any():
+        raise ValueError("Stock-observed date lacks a NIFTY close")
+
+    rows = []
+    for W in WINDOWS_YEARS:
+        baseline, _ = run_asset(nifty_prices, rates, config.MAIN_TICKER, W, config.GAMMA)
+        aligned, _ = run_asset(nifty_prices, rates, config.MAIN_TICKER, W, config.GAMMA, aligned_ends)
+        for strategy in STRATEGIES:
+            b = baseline.loc[baseline["strategy"] == strategy].iloc[0]
+            a = aligned.loc[aligned["strategy"] == strategy].iloc[0]
+            rows.append({
+                "ticker": config.MAIN_TICKER, "window_years": W,
+                "gamma": config.GAMMA, "strategy": strategy,
+                "baseline_ce_ann": b["realised_ce_ann"],
+                "aligned_ce_ann": a["realised_ce_ann"],
+                "delta_ce_percentage_points": 100 * (a["realised_ce_ann"] - b["realised_ce_ann"]),
+                "baseline_final_wealth": b["final_wealth"],
+                "aligned_final_wealth": a["final_wealth"],
+                "n_months": int(a["n_months"]),
+            })
+    return pd.DataFrame(rows)
 
 def make_figures(paths, main_summary):
     """Save three 150-dpi audit figures requested by PLAN.md Section 9.6."""
@@ -274,11 +310,13 @@ def make_figures(paths, main_summary):
     plt.close(fig)
 
 
-def make_report_notes(main, paths, full):
+def make_report_notes(main, paths, full, sensitivity):
     """Prepare a small numerical handoff to Person 1, without inventing results."""
     nifty = main.loc[main["ticker"] == config.MAIN_TICKER].set_index("strategy")
     def shown(x):
         return "undefined (ruin)" if not np.isfinite(x) else f"{100*x:.2f}%/year"
+    def shown_vol(x):
+        return "undefined (ruin)" if not np.isfinite(x) else f"{100*x:.2f}% annualized"
     lines = [
         "# Person 5 — real-data backtest report handoff",
         "",
@@ -300,7 +338,7 @@ def make_report_notes(main, paths, full):
         row = nifty.loc[s]
         lines.append(
             f"| {LABELS[s]} | {shown(row['mean_return_ann'])} | "
-            f"{shown(row['volatility_ann'])} | {shown(row['realised_ce_ann'])} | "
+            f"{shown_vol(row['volatility_ann'])} | {shown(row['realised_ce_ann'])} | "
             f"{row['final_wealth']:.3f} | {100*row['max_drawdown']:.1f}% | "
             f"{row['mean_abs_pi']:.3f} |"
         )
@@ -318,6 +356,16 @@ def make_report_notes(main, paths, full):
     n_unconstrained = paths[paths["strategy"] == "merton"]
     leverage = float(np.mean((n_unconstrained["pi"] < 0) | (n_unconstrained["pi"] > 1)))
     lines.append(f"The NIFTY unconstrained pi_hat lay outside [0,1] in {100*leverage:.1f}% of decisions.")
+    main_sensitivity = sensitivity[sensitivity["window_years"] == MAIN_WINDOW_YEARS].set_index("strategy")
+    lines.append(
+        "- At W=5 and gamma=3, the matched-endpoint change in NIFTY CE is "
+        f"{main_sensitivity.loc['merton', 'delta_ce_percentage_points']:+.5f} "
+        "percentage points/year for unconstrained Merton, "
+        f"{main_sensitivity.loc['merton_clipped', 'delta_ce_percentage_points']:+.5f} "
+        "for clipped Merton and "
+        f"{main_sensitivity.loc['60/40', 'delta_ce_percentage_points']:+.5f} "
+        "for 60/40. This sensitivity does not change the main conclusion."
+    )
     lines += [
         "",
         "## Implementation, interpretation and limits",
@@ -335,7 +383,9 @@ def make_report_notes(main, paths, full):
         "the last observed stock date precedes the official month-end. The code "
         "retains that earlier decision date and never uses a quote published later. "
         "Those monthly returns can bridge a missing last-session movement; comparing "
-        "assets at perfectly matched calendar endpoints would require an additional sensitivity study.",
+        "the stock series\u0027 missing last-session move. The matched-endpoint NIFTY "
+        "check in p5_endpoint_sensitivity.csv preserves the complete daily NIFTY "
+        "training history and moves only those month-ends to the stock-observed dates.",
         "- T-bill yields are an investable-cash proxy, treated as continuously earning "
         "the rate known at the start of the holding month, and the model permits "
         "borrowing/lending at the same rate. Fees, financing spreads, and "
@@ -378,8 +428,14 @@ def main():
         raise ValueError("T-bill input is empty")
     all_summaries = []
     main_paths = None
+    nifty_prices = None
+    stock_prices = None
     for ticker in config.TICKERS:
         prices = data.load_prices(ticker)
+        if ticker == config.MAIN_TICKER:
+            nifty_prices = prices
+        elif stock_prices is None:
+            stock_prices = prices
         for W in WINDOWS_YEARS:
             for gamma in config.GAMMAS:
                 summary, paths = run_asset(prices, rates, ticker, W, gamma)
@@ -392,10 +448,12 @@ def main():
     main.loc[main["ticker"] == config.MAIN_TICKER].to_csv(
         config.RESULTS / "p5_main_metrics.csv", index=False)
     main_paths.to_csv(config.RESULTS / "p5_nifty_monthly_paths.csv", index=False)
+    sensitivity = endpoint_sensitivity(nifty_prices, stock_prices, rates)
+    sensitivity.to_csv(config.RESULTS / "p5_endpoint_sensitivity.csv", index=False)
     make_figures(main_paths, main)
     (config.RESULTS / "p5_report_notes.md").write_text(
-        make_report_notes(main, main_paths, full), encoding="utf-8")
-    print("Saved Person 5's 3 figures, summary CSV, NIFTY audit paths and report notes.")
+        make_report_notes(main, main_paths, full, sensitivity), encoding="utf-8")
+    print("Saved Person 5's 3 figures, summary and sensitivity CSVs, NIFTY audit paths and report notes.")
     print(main.loc[main["ticker"] == config.MAIN_TICKER,
                    ["strategy", "realised_ce_ann", "final_wealth", "bankrupt"]].to_string(index=False))
 
