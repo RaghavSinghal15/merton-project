@@ -82,3 +82,16 @@ def test_end_to_end_strategies_share_months_and_cash_matches_product():
     np.testing.assert_allclose(cash['wealth'].iloc[-1], cash_wealth)
     np.testing.assert_allclose(stock['wealth'].iloc[-1], stock_wealth)
     assert np.isnan(summary.set_index('strategy').loc['cash', 'sharpe'])
+
+def test_endpoint_sensitivity_uses_earlier_stock_endpoints():
+    """Alternative month-end NIFTY checks must run without filling missing stock dates."""
+    from experiments.p5_backtest import endpoint_sensitivity
+
+    nifty_prices, rates = sample_history()
+    month_ends = nifty_prices.groupby(nifty_prices.index.to_period("M")).tail(1)
+    stock_prices = nifty_prices.drop(month_ends.index[12::24])
+    sensitivity = endpoint_sensitivity(nifty_prices, stock_prices, rates)
+
+    assert len(sensitivity) == 3 * 6  # 3 windows, 6 strategies
+    assert np.isfinite(sensitivity["delta_ce_percentage_points"]).all()
+    assert (np.abs(sensitivity["delta_ce_percentage_points"]) > 0).any()
